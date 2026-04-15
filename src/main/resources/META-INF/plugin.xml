@@ -1,0 +1,40 @@
+<idea-plugin>
+    <id>com.wlzn.nacos-console</id>
+    <name>WLZN Nacos Console</name>
+    <vendor email="jeffhanboo@gmail.com" >HWL</vendor>
+
+    <description><![CDATA[
+        <p>A Nacos configuration management plugin that automatically parses Spring Boot
+        multi-profile YAML files, connects to Nacos servers, and provides an intuitive
+        tool window for browsing, editing, and publishing configurations.</p>
+
+        <h3>Features</h3>
+        <ul>
+            <li>Auto-detect Spring Boot config files (application.yml / bootstrap.yml)</li>
+            <li>Parse multi-document YAML with profile-based environment isolation</li>
+            <li>Browse all configurations under a Nacos namespace</li>
+            <li>Refresh and fetch the latest configuration content</li>
+            <li>Edit and publish configurations directly from the IDE</li>
+            <li>Search / filter configurations by DataId or Group</li>
+        </ul>
+
+        <h3>功能</h3>
+        <ul>
+            <li>自动扫描项目中的 Spring Boot 配置文件</li>
+            <li>解析多文档 YAML，按 profile 隔离多环境配置</li>
+            <li>一键连接 Nacos，浏览命名空间下所有配置</li>
+            <li>实时刷新、获取最新配置内容</li>
+            <li>在 IDE 内直接编辑并发布配置</li>
+        </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <notificationGroup id="Nacos Console"
+                           displayType="BALLOON"/>
+        <toolWindow id="Nacos Console"
+                    anchor="bottom"
+                    factoryClass="com.wlzn.nacos.ui.NacosToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
