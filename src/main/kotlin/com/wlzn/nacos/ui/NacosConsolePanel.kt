@@ -5,6 +5,7 @@ import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.WriteIntentReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
@@ -178,8 +179,6 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         val basePath = project.basePath ?: return
         val baseDir = LocalFileSystem.getInstance().findFileByPath(basePath) ?: return
 
-        FileDocumentManager.getInstance().saveAllDocuments()
-
         val targetNames = setOf(
             "application.yml", "application.yaml",
             "bootstrap.yml", "bootstrap.yaml"
@@ -201,7 +200,10 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             }
         }
 
-        ApplicationManager.getApplication().runReadAction { search(baseDir) }
+        WriteIntentReadAction.run {
+            FileDocumentManager.getInstance().saveAllDocuments()
+            search(baseDir)
+        }
 
         configFileComboBox.removeAllItems()
         for (path in configFileMap.keys) {
@@ -226,7 +228,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         val vFile = configFileMap[selectedPath] ?: return
 
         try {
-            val content = ApplicationManager.getApplication().runReadAction<String> {
+            val content = WriteIntentReadAction.compute<String> {
                 val document = FileDocumentManager.getInstance().getDocument(vFile)
                 document?.text ?: String(vFile.contentsToByteArray(), Charsets.UTF_8)
             }
