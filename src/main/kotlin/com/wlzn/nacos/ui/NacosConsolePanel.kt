@@ -5,16 +5,20 @@ import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.application.WriteIntentReadAction
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.progress.ProcessCanceledException
+import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VFileProperty
 import com.intellij.ui.JBSplitter
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.table.JBTable
+import com.intellij.util.concurrency.AppExecutorUtil
 import com.wlzn.nacos.model.NacosConfigItem
 import com.wlzn.nacos.model.NacosEnvironment
 import com.wlzn.nacos.service.NacosApiClient
@@ -52,6 +56,12 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     @Volatile
     private var allConfigItems = listOf<NacosConfigItem>()
     private var displayedConfigItems = listOf<NacosConfigItem>()
+    private var contentRequestId = 0
+    private var configParseId = 0
+    private var connectionId = 0
+    private var scanning = false
+    private var busy = false
+    private var contentLoaded = false
     @Volatile
     private var currentToken: String = ""
     @Volatile
@@ -106,7 +116,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
         contentArea.font = Font(Font.MONOSPACED, Font.PLAIN, 13)
         contentArea.tabSize = 2
-        contentArea.isEditable = true
+        contentArea.isEditable = false
         contentArea.margin = Insets(5, 5, 5, 5)
         rightPanel.add(JBScrollPane(contentArea), BorderLayout.CENTER)
 
@@ -176,9 +186,11 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun scanConfigFiles() {
+        if (disposed || project.isDisposed || scanning) return
         val basePath = project.basePath ?: return
-        val baseDir = LocalFileSystem.getInstance().findFileByPath(basePath) ?: return
-
+        scanning = true
+        scanButton.isEnabled = false
+        setStatus("正在扫描配置文件...")
         val targetNames = setOf(
             "application.yml", "application.yaml",
             "bootstrap.yml", "bootstrap.yaml"
@@ -186,69 +198,81 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         val skipDirs = setOf(".git", "build", ".gradle", "node_modules", "target", ".idea", "out")
 
         val previousSelection = configFileComboBox.selectedItem as? String
-        configFileMap.clear()
-
-        fun search(dir: VirtualFile) {
-            for (child in dir.children) {
-                if (child.isDirectory) {
-                    if (child.name !in skipDirs) search(child)
-                } else if (child.name in targetNames) {
-                    child.refresh(false, false)
-                    val relativePath = child.path.removePrefix(basePath).removePrefix("/").removePrefix("\\")
-                    configFileMap[relativePath] = child
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val baseDir = LocalFileSystem.getInstance().refreshAndFindFileByPath(basePath)
+            if (baseDir == null) {
+                invokeLaterIfAlive {
+                    scanning = false
+                    scanButton.isEnabled = !busy
+                    setStatus("项目目录不存在")
                 }
+                return@executeOnPooledThread
             }
-        }
-
-        WriteIntentReadAction.run {
-            FileDocumentManager.getInstance().saveAllDocuments()
-            search(baseDir)
-        }
-
-        configFileComboBox.removeAllItems()
-        for (path in configFileMap.keys) {
-            configFileComboBox.addItem(path)
-        }
-
-        if (configFileMap.isNotEmpty()) {
-            val restoreIdx = if (previousSelection != null) {
-                (0 until configFileComboBox.itemCount).firstOrNull {
-                    configFileComboBox.getItemAt(it) == previousSelection
-                } ?: 0
-            } else 0
-            configFileComboBox.selectedIndex = restoreIdx
-            onConfigFileSelected()
-        } else {
-            setStatus("未找到 Spring Boot 配置文件 (application.yml / bootstrap.yml)")
+            // VFS 刷新不能在读动作中同步执行，刷新完成后再可取消地遍历。
+            baseDir.refresh(true, true) {
+                ReadAction.nonBlocking<Map<String, VirtualFile>> {
+                    val files = linkedMapOf<String, VirtualFile>()
+                    fun search(dir: VirtualFile) {
+                        ProgressManager.checkCanceled()
+                        for (child in dir.children) {
+                            if (child.isDirectory) {
+                                if (child.name !in skipDirs && !child.`is`(VFileProperty.SYMLINK)) search(child)
+                            } else if (child.name in targetNames) {
+                                files[child.path.removePrefix(basePath).removePrefix("/")] = child
+                            }
+                        }
+                    }
+                    search(baseDir)
+                    files
+                }.expireWith(this)
+                    .finishOnUiThread(ModalityState.nonModal()) { files ->
+                        if (disposed || project.isDisposed) return@finishOnUiThread
+                        configFileMap.clear()
+                        configFileMap.putAll(files)
+                        configFileComboBox.model = DefaultComboBoxModel(files.keys.toTypedArray())
+                        scanning = false
+                        scanButton.isEnabled = !busy
+                        if (files.isNotEmpty()) {
+                            configFileComboBox.selectedItem = previousSelection?.takeIf { it in files } ?: files.keys.first()
+                            onConfigFileSelected()
+                        } else {
+                            envComboBox.removeAllItems()
+                            setStatus("未找到 Spring Boot 配置文件 (application.yml / bootstrap.yml)")
+                        }
+                    }.submit(AppExecutorUtil.getAppExecutorService())
+            }
         }
     }
 
     private fun onConfigFileSelected() {
         val selectedPath = configFileComboBox.selectedItem as? String ?: return
         val vFile = configFileMap[selectedPath] ?: return
+        val parseId = ++configParseId
+        envComboBox.removeAllItems()
+        connectButton.isEnabled = false
 
-        try {
-            val content = WriteIntentReadAction.compute<String> {
+        ReadAction.nonBlocking<Result<List<NacosEnvironment>>> {
+            try {
                 val document = FileDocumentManager.getInstance().getDocument(vFile)
-                document?.text ?: String(vFile.contentsToByteArray(), Charsets.UTF_8)
+                Result.success(configParser.parse(document?.text ?: String(vFile.contentsToByteArray(), Charsets.UTF_8)))
+            } catch (e: ProcessCanceledException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
             }
-            val environments = configParser.parse(content)
-
-            envComboBox.removeAllItems()
-            for (env in environments) {
-                envComboBox.addItem(env)
-            }
-
-            if (environments.isNotEmpty()) {
-                envComboBox.selectedIndex = 0
-                setStatus("已解析 ${environments.size} 个环境配置")
-            } else {
-                setStatus("配置文件中未找到 Nacos 配置")
-            }
-        } catch (e: Exception) {
-            LOG.warn("Failed to parse config file: $selectedPath", e)
-            setStatus("解析配置文件失败: ${e.message}")
-        }
+        }.expireWith(this)
+            .finishOnUiThread(ModalityState.nonModal()) { result ->
+                if (disposed || project.isDisposed || parseId != configParseId || configFileComboBox.selectedItem != selectedPath) return@finishOnUiThread
+                envComboBox.removeAllItems()
+                result.fold(onSuccess = { environments ->
+                    environments.forEach { envComboBox.addItem(it) }
+                    connectButton.isEnabled = !busy && environments.isNotEmpty()
+                    setStatus(if (environments.isNotEmpty()) "已解析 ${environments.size} 个环境配置" else "配置文件中未找到 Nacos 配置")
+                }, onFailure = { e ->
+                    LOG.warn("Failed to parse config file: $selectedPath", e)
+                    setStatus("解析配置文件失败: ${e.message}")
+                })
+            }.submit(AppExecutorUtil.getAppExecutorService())
     }
 
     private fun connectToNacos() {
@@ -257,19 +281,25 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             return
         }
 
-        currentEnv = env
+        connectionId++
+        val requestConnectionId = connectionId
+        currentEnv = null
+        currentToken = ""
+        allConfigItems = emptyList()
+        updateConfigTable(emptyList())
         setStatus("正在连接 ${env.serverAddr} ...")
         setUIEnabled(false)
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
-                currentToken = loginResp.accessToken
-
-                val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, currentToken)
-                allConfigItems = configResp.pageItems
+                val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, loginResp.accessToken)
 
                 invokeLaterIfAlive {
+                    if (connectionId != requestConnectionId) return@invokeLaterIfAlive
+                    currentEnv = env
+                    currentToken = loginResp.accessToken
+                    allConfigItems = configResp.pageItems
                     updateConfigTable(allConfigItems)
                     refreshButton.isEnabled = true
                     setUIEnabled(true)
@@ -288,6 +318,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
     private fun refreshConfigList() {
         val env = currentEnv ?: return
+        val requestConnectionId = connectionId
 
         setStatus("正在刷新配置列表...")
         setUIEnabled(false)
@@ -295,15 +326,15 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
-                currentToken = loginResp.accessToken
-
-                val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, currentToken)
-                allConfigItems = configResp.pageItems
+                val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, loginResp.accessToken)
 
                 invokeLaterIfAlive {
-                    val selectedDataId = getSelectedConfigItem()?.dataId
+                    if (connectionId != requestConnectionId) return@invokeLaterIfAlive
+                    currentToken = loginResp.accessToken
+                    allConfigItems = configResp.pageItems
+                    val selectedItem = getSelectedConfigItem()
                     updateConfigTable(allConfigItems)
-                    restoreSelection(selectedDataId)
+                    restoreSelection(selectedItem)
                     setUIEnabled(true)
                     setStatus("已刷新，共 ${configResp.totalCount} 个配置")
                 }
@@ -338,6 +369,9 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun onConfigItemSelected() {
+        contentRequestId++
+        contentLoaded = false
+        contentArea.isEditable = false
         val item = getSelectedConfigItem() ?: run {
             contentArea.text = ""
             publishButton.isEnabled = false
@@ -353,28 +387,43 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         } ?: -1
         if (typeIdx >= 0) typeComboBox.selectedIndex = typeIdx
 
-        publishButton.isEnabled = true
-        fetchLatestButton.isEnabled = true
+        publishButton.isEnabled = false
+        fetchLatestButton.isEnabled = !busy
         setStatus("已选中: ${item.dataId} [${item.group}]")
+        fetchLatestConfig()
     }
 
     private fun fetchLatestConfig() {
         val item = getSelectedConfigItem() ?: return
         val env = currentEnv ?: return
+        val requestId = ++contentRequestId
+        val requestConnectionId = connectionId
+        val token = currentToken
+        contentLoaded = false
+        contentArea.isEditable = false
+        publishButton.isEnabled = false
+        fetchLatestButton.isEnabled = false
 
         setStatus("正在获取 ${item.dataId} 的最新配置...")
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val content = apiClient.getConfig(env.serverAddr, item.dataId, item.group, env.namespace, currentToken)
+                val content = apiClient.getConfig(env.serverAddr, item.dataId, item.group, env.namespace, token)
                 invokeLaterIfAlive {
+                    if (requestId != contentRequestId || requestConnectionId != connectionId) return@invokeLaterIfAlive
                     contentArea.text = content
                     contentArea.caretPosition = 0
+                    contentLoaded = true
+                    contentArea.isEditable = !busy
+                    publishButton.isEnabled = !busy
+                    fetchLatestButton.isEnabled = !busy
                     setStatus("已获取 ${item.dataId} 的最新配置")
                 }
             } catch (e: Exception) {
                 LOG.warn("Failed to fetch config: ${item.dataId}", e)
                 invokeLaterIfAlive {
+                    if (requestId != contentRequestId || requestConnectionId != connectionId) return@invokeLaterIfAlive
+                    fetchLatestButton.isEnabled = !busy
                     setStatus("获取失败: ${e.message}")
                 }
             }
@@ -382,6 +431,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun publishConfig() {
+        if (busy || !contentLoaded) return
         val item = getSelectedConfigItem() ?: return
         val env = currentEnv ?: return
         val content = contentArea.text
@@ -405,14 +455,17 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         if (confirm != Messages.YES) return
 
         val type = typeComboBox.selectedItem as? String ?: "yaml"
+        val token = currentToken
+        setUIEnabled(false)
         setStatus("正在发布 ${item.dataId} ...")
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val success = apiClient.publishConfig(
-                    env.serverAddr, item.dataId, item.group, env.namespace, content, type, currentToken
+                    env.serverAddr, item.dataId, item.group, env.namespace, content, type, token
                 )
                 invokeLaterIfAlive {
+                    setUIEnabled(true)
                     if (success) {
                         setStatus("发布成功: ${item.dataId}")
                         notify("配置 ${item.dataId} 发布成功", NotificationType.INFORMATION)
@@ -425,6 +478,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             } catch (e: Exception) {
                 LOG.warn("Failed to publish config: ${item.dataId}", e)
                 invokeLaterIfAlive {
+                    setUIEnabled(true)
                     setStatus("发布异常: ${e.message}")
                     notify("发布异常: ${e.message}", NotificationType.ERROR)
                 }
@@ -438,9 +492,9 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         return displayedConfigItems[row]
     }
 
-    private fun restoreSelection(dataId: String?) {
-        if (dataId == null) return
-        val idx = displayedConfigItems.indexOfFirst { it.dataId == dataId }
+    private fun restoreSelection(item: NacosConfigItem?) {
+        if (item == null) return
+        val idx = displayedConfigItems.indexOfFirst { it.dataId == item.dataId && it.group == item.group }
         if (idx >= 0) {
             configTable.setRowSelectionInterval(idx, idx)
         }
@@ -451,11 +505,17 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun setUIEnabled(enabled: Boolean) {
-        connectButton.isEnabled = enabled
+        busy = !enabled
+        connectButton.isEnabled = enabled && envComboBox.itemCount > 0
         refreshButton.isEnabled = enabled && currentEnv != null
         configFileComboBox.isEnabled = enabled
         envComboBox.isEnabled = enabled
-        scanButton.isEnabled = enabled
+        scanButton.isEnabled = enabled && !scanning
+        configTable.isEnabled = enabled
+        searchField.isEnabled = enabled
+        contentArea.isEditable = enabled && contentLoaded
+        publishButton.isEnabled = enabled && contentLoaded && getSelectedConfigItem() != null
+        fetchLatestButton.isEnabled = enabled && getSelectedConfigItem() != null
     }
 
     private fun invokeLaterIfAlive(action: () -> Unit) {

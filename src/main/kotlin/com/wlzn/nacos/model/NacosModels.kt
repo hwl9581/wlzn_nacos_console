@@ -1,5 +1,7 @@
 package com.wlzn.nacos.model
 
+import com.google.gson.annotations.SerializedName
+
 class NacosEnvironment(
     val profileName: String,
     val serverAddr: String,
@@ -21,9 +23,11 @@ class NacosEnvironment(
 data class NacosConfigItem(
     val id: Long = 0,
     val dataId: String = "",
+    @SerializedName(value = "group", alternate = ["groupName"])
     val group: String = "",
     val content: String = "",
     val type: String = "",
+    @SerializedName(value = "tenant", alternate = ["namespaceId"])
     val tenant: String = "",
     val md5: String = "",
     val appName: String = ""

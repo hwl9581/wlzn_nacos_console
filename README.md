@@ -1,4 +1,22 @@
-# IntelliJ Platform Plugin Template
+# WLZN Nacos Console
+
+在 IDEA 工具窗口中扫描 Spring Boot YAML、连接 Nacos、查看和发布配置。1.0.1 适配 Nacos 3 控制台 API，并保留 Nacos 1/2 接口回退。列表、详情和发布均检查新版业务响应；只有新端点返回 HTTP 404/410 时才回退，鉴权失败、服务异常或超时不会自动重复发布。
+
+配置中的 `nacos.server-addr` 默认使用 `/nacos` 上下文，普通尾斜杠保持这一行为。地址已带 `/nacos` 或自定义路径时直接使用。独立部署在其他端口的控制台需配置实际可访问的地址与上下文；本轮未支持根上下文的独立控制台，不会自动猜测或切换端口。
+
+构建并运行本地模拟接口回归测试：
+
+```bash
+./gradlew test buildPlugin
+# 可选：直接使用本机安装的 SDK（此处为 macOS 示例）
+./gradlew test buildPlugin -PplatformLocalPath='/Applications/IntelliJ IDEA.app/Contents'
+```
+
+产物位于 `build/distributions/`。在 IDEA 的 Settings → Plugins → 齿轮 → Install Plugin from Disk 中选择 ZIP。测试只连接本机模拟服务，不会发布真实配置。
+
+安装后检查：扫描能发现新建/修改的 YAML，未保存内容可解析；连接后选择配置能加载正文；快速切换行时正文与 DataId/Group 一致；发布仍须确认目标环境。真实服务的权限、端口及配置写入需在测试环境验证。
+
+以下保留原始模板的开发参考。
 
 [![Twitter Follow](https://img.shields.io/badge/follow-%40JBPlatform-1DA1F2?logo=twitter)](https://twitter.com/JBPlatform)
 [![Developers Forum](https://img.shields.io/badge/JetBrains%20Platform-Join-blue)][jb:forum]
