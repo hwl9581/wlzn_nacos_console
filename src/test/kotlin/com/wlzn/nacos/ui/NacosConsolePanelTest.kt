@@ -23,6 +23,11 @@ class NacosConsolePanelTest : BasePlatformTestCase() {
         val executor = Executors.newCachedThreadPool()
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server.executor = executor
+        server.createContext("/nacos/v3/console/cs/config/list") { exchange ->
+            val bytes = """{"code":0,"data":{"totalCount":0,"pageItems":[]}}""".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
         server.createContext("/nacos/v3/console/cs/config") { exchange ->
             val first = exchange.requestURI.rawQuery.contains("dataId=first.yml")
             if (first) {

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.wlzn"
-version = "1.0.1"
+version = "1.0.2"
 
 // Set the JVM language level used to build the project.
 kotlin {
@@ -43,6 +43,7 @@ intellijPlatform {
 
         changeNotes = """
             <ul>
+                <li><b>1.0.2</b> — Fix Nacos 3 server-port connections using Admin APIs, support root-context consoles, and discover routes with read-only requests before publishing.</li>
                 <li><b>1.0.1</b> — Support Nacos 3 console APIs with legacy fallback; load configuration details safely and scan files in the background.</li>
                 <li><b>1.0.0</b> — Initial release: multi-environment config parsing, config browsing, refresh &amp; publish.</li>
             </ul>
