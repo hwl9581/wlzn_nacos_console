@@ -2,6 +2,7 @@ package com.wlzn.nacos.ui
 
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -12,13 +13,18 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VFileProperty
 import com.intellij.ui.JBSplitter
+import com.intellij.ui.JBColor
+import com.intellij.ui.SearchTextField
+import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.table.JBTable
 import com.intellij.util.concurrency.AppExecutorUtil
+import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
 import com.wlzn.nacos.model.NacosConfigItem
 import com.wlzn.nacos.model.NacosEnvironment
 import com.wlzn.nacos.service.NacosApiClient
@@ -27,7 +33,6 @@ import java.awt.*
 import javax.swing.*
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
-import javax.swing.table.DefaultTableModel
 
 class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
 
@@ -39,23 +44,29 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     private val connectButton = JButton("连接")
     private val refreshButton = JButton("刷新列表")
     private val scanButton = JButton("扫描配置文件")
-    private val searchField = JTextField(15)
-
-    private val tableModel = object : DefaultTableModel(arrayOf("DataId", "Group", "类型"), 0) {
-        override fun isCellEditable(row: Int, column: Int) = false
-    }
-    private val configTable = JBTable(tableModel)
-
-    private val contentArea = JTextArea()
+    private val searchField = SearchTextField(false)
+    private val listModel = DefaultListModel<NacosConfigItem>()
+    private val configList = JBList(listModel)
+    private val contentArea = NacosConfigEditor(project)
     private val typeComboBox = JComboBox(arrayOf("yaml", "properties", "json", "text", "xml", "html"))
-    private val publishButton = JButton("发布配置")
+    private val publishButton = object : JButton("发布配置") {
+        // 只使用原生主按钮外观，不给工具窗口注册回车发布快捷键。
+        override fun isDefaultButton() = true
+    }
     private val fetchLatestButton = JButton("获取最新")
+    private val historyButton = JButton("历史版本")
 
     private val statusLabel = JLabel(" 就绪")
+    private val connectionLabel = smallLabel("未连接")
+    private val countLabel = smallLabel("0")
+    private val configTitle = JLabel("未选择配置")
+    private val configMetadata = smallLabel("选择配置后显示 Data ID / Group / Namespace")
+    private val editorInfo = smallLabel("UTF-8 · 2 空格")
+    private val highlightingLabel = smallLabel("语法高亮跟随 IDEA 编辑器配色")
+    private var updatingList = false
 
     @Volatile
     private var allConfigItems = listOf<NacosConfigItem>()
-    private var displayedConfigItems = listOf<NacosConfigItem>()
     private var contentRequestId = 0
     private var configParseId = 0
     private var connectionId = 0
@@ -71,6 +82,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     private var disposed = false
 
     init {
+        Disposer.register(this, contentArea)
         setupUI()
         setupListeners()
         ApplicationManager.getApplication().invokeLater({ scanConfigFiles() }, ModalityState.nonModal())
@@ -81,70 +93,129 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun setupUI() {
-        val topPanel = JPanel()
-        topPanel.layout = BoxLayout(topPanel, BoxLayout.Y_AXIS)
+        val topPanel = JPanel(GridBagLayout()).apply {
+            border = BorderFactory.createCompoundBorder(JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0), JBUI.Borders.empty(8, 12))
+        }
+        configFileComboBox.preferredSize = JBUI.size(300, 30)
+        configFileComboBox.minimumSize = JBUI.size(100, 30)
+        configFileComboBox.toolTipText = "用于解析 Nacos 环境的 Spring Boot 配置文件"
+        envComboBox.preferredSize = JBUI.size(175, 30)
+        envComboBox.minimumSize = JBUI.size(110, 30)
+        envComboBox.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(list: JList<*>?, value: Any?, index: Int, selected: Boolean, focus: Boolean): Component {
+                super.getListCellRendererComponent(list, value, index, selected, focus)
+                putClientProperty("html.disable", true)
+                text = (value as? NacosEnvironment)?.profileName ?: "选择环境"
+                toolTipText = (value as? NacosEnvironment)?.serverAddr
+                return this
+            }
+        }
+        scanButton.text = ""
+        scanButton.icon = AllIcons.Actions.Find
+        scanButton.toolTipText = "扫描配置文件"
+        scanButton.accessibleContext.accessibleName = "扫描配置文件"
+        scanButton.preferredSize = JBUI.size(28, 28)
+        refreshButton.text = ""
+        refreshButton.icon = AllIcons.Actions.Refresh
+        refreshButton.toolTipText = "刷新配置列表"
+        refreshButton.accessibleContext.accessibleName = "刷新配置列表"
+        refreshButton.preferredSize = JBUI.size(28, 28)
+        fetchLatestButton.icon = AllIcons.Actions.Refresh
+        historyButton.icon = AllIcons.Vcs.History
+        publishButton.icon = AllIcons.Actions.Upload
+        val controls = listOf(smallLabel("配置源"), configFileComboBox, scanButton, smallLabel("环境"), envComboBox, connectButton, connectionLabel)
+        controls.forEachIndexed { index, component ->
+            topPanel.add(component, GridBagConstraints().apply {
+                gridx = index; gridy = 0
+                weightx = if (component === connectionLabel) 1.0 else 0.0
+                fill = GridBagConstraints.NONE
+                anchor = if (component === connectionLabel) GridBagConstraints.EAST else GridBagConstraints.WEST
+                insets = JBUI.insets(0, if (index == 0) 0 else 8, 0, 0)
+            })
+        }
 
-        val row1 = JPanel(FlowLayout(FlowLayout.LEFT, 5, 4))
-        row1.add(JLabel("配置文件:"))
-        configFileComboBox.preferredSize = Dimension(350, 28)
-        row1.add(configFileComboBox)
-        row1.add(scanButton)
+        configList.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        configList.emptyText.text = "连接 Nacos 后显示配置"
+        configList.cellRenderer = ListCellRenderer { list, item, _, selected, _ ->
+            val foreground = if (selected) list.selectionForeground else list.foreground
+            JPanel(BorderLayout(JBUI.scale(8), 0)).apply {
+                background = if (selected) list.selectionBackground else list.background
+                border = JBUI.Borders.empty(10, 12)
+                add(JLabel(AllIcons.FileTypes.Config), BorderLayout.WEST)
+                add(JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                    isOpaque = false
+                    add(JLabel(item.dataId).apply { this.foreground = foreground; putClientProperty("html.disable", true) }, BorderLayout.NORTH)
+                    add(smallLabel(item.group).apply { if (selected) this.foreground = foreground }, BorderLayout.SOUTH)
+                }, BorderLayout.CENTER)
+                add(smallLabel(item.type.ifBlank { "text" }).apply { if (selected) this.foreground = foreground }, BorderLayout.EAST)
+                toolTipText = "Data ID: ${item.dataId} · ${item.group}"
+                size = Dimension(list.width.coerceAtLeast(1), preferredSize.height)
+                doLayout()
+                components.filterIsInstance<JPanel>().forEach { it.doLayout() }
+            }
+        }
+        val listHeader = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(8, 12)
+            add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
+                isOpaque = false; add(JLabel("配置列表")); add(countLabel)
+            }, BorderLayout.WEST)
+            add(refreshButton, BorderLayout.EAST)
+        }
+        searchField.textEditor.emptyText.text = "搜索 Data ID / Group"
+        searchField.textEditor.accessibleContext.accessibleName = "搜索 Data ID 或 Group"
+        val searchPanel = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(0, 12, 10, 12)
+            add(searchField)
+        }
+        val leftPanel = JPanel(BorderLayout()).apply {
+            add(JPanel(BorderLayout()).apply { add(listHeader, BorderLayout.NORTH); add(searchPanel, BorderLayout.CENTER) }, BorderLayout.NORTH)
+            add(JBScrollPane(configList).apply { border = JBUI.Borders.empty() }, BorderLayout.CENTER)
+            minimumSize = JBUI.size(200, 180)
+        }
 
-        val row2 = JPanel(FlowLayout(FlowLayout.LEFT, 5, 4))
-        row2.add(JLabel("环境:"))
-        envComboBox.preferredSize = Dimension(250, 28)
-        row2.add(envComboBox)
-        row2.add(connectButton)
-        row2.add(refreshButton)
-        row2.add(Box.createHorizontalStrut(20))
-        row2.add(JLabel("搜索:"))
-        row2.add(searchField)
+        configTitle.putClientProperty("html.disable", true)
+        configTitle.icon = AllIcons.FileTypes.Config
+        val editorHeader = JPanel(BorderLayout(12, 0)).apply {
+            border = BorderFactory.createCompoundBorder(JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0), JBUI.Borders.empty(10, 14))
+            add(JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                isOpaque = false; add(configTitle, BorderLayout.NORTH); add(configMetadata, BorderLayout.SOUTH)
+            }, BorderLayout.CENTER)
+            add(JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+                isOpaque = false; add(historyButton); add(fetchLatestButton); add(publishButton)
+            }, BorderLayout.EAST)
+        }
+        val formatPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+            isOpaque = false; add(smallLabel("格式")); add(typeComboBox)
+        }
+        val editorFooter = JPanel(BorderLayout(8, 0)).apply {
+            border = BorderFactory.createCompoundBorder(JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0), JBUI.Borders.empty(6, 12))
+            add(highlightingLabel, BorderLayout.CENTER); add(formatPanel, BorderLayout.EAST)
+        }
+        val rightPanel = JPanel(BorderLayout()).apply {
+            add(editorHeader, BorderLayout.NORTH); add(contentArea, BorderLayout.CENTER); add(editorFooter, BorderLayout.SOUTH)
+            minimumSize = JBUI.size(320, 180)
+        }
 
-        topPanel.add(row1)
-        topPanel.add(row2)
-
-        configTable.selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        configTable.rowHeight = 26
-        configTable.setShowGrid(true)
-        configTable.gridColor = Color(230, 230, 230)
-
-        val leftPanel = JPanel(BorderLayout())
-        leftPanel.add(JBScrollPane(configTable), BorderLayout.CENTER)
-        leftPanel.minimumSize = Dimension(300, 200)
-
-        val rightPanel = JPanel(BorderLayout())
-
-        contentArea.font = Font(Font.MONOSPACED, Font.PLAIN, 13)
-        contentArea.tabSize = 2
-        contentArea.isEditable = false
-        contentArea.margin = Insets(5, 5, 5, 5)
-        rightPanel.add(JBScrollPane(contentArea), BorderLayout.CENTER)
-
-        val actionPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 8, 4))
-        actionPanel.add(fetchLatestButton)
-        actionPanel.add(JSeparator(SwingConstants.VERTICAL).apply { preferredSize = Dimension(1, 24) })
-        actionPanel.add(JLabel("格式:"))
-        actionPanel.add(typeComboBox)
-        actionPanel.add(publishButton)
-        rightPanel.add(actionPanel, BorderLayout.SOUTH)
-
-        val splitter = JBSplitter(false, 0.3f)
+        val splitter = JBSplitter(false, 0.25f)
         splitter.firstComponent = leftPanel
         splitter.secondComponent = rightPanel
-
-        statusLabel.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 0, 0, Color(200, 200, 200)),
-            BorderFactory.createEmptyBorder(4, 8, 4, 8)
-        )
-        statusLabel.font = statusLabel.font.deriveFont(12f)
+        val statusPanel = JPanel(BorderLayout(12, 0)).apply {
+            border = BorderFactory.createCompoundBorder(JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0), JBUI.Borders.empty(5, 12))
+            add(statusLabel, BorderLayout.CENTER); add(editorInfo, BorderLayout.EAST)
+        }
+        statusLabel.foreground = UIUtil.getContextHelpForeground()
+        statusLabel.font = UIUtil.getLabelFont(UIUtil.FontSize.SMALL)
+        statusLabel.putClientProperty("html.disable", true)
 
         add(topPanel, BorderLayout.NORTH)
         add(splitter, BorderLayout.CENTER)
-        add(statusLabel, BorderLayout.SOUTH)
+        add(statusPanel, BorderLayout.SOUTH)
 
         refreshButton.isEnabled = false
         publishButton.isEnabled = false
         fetchLatestButton.isEnabled = false
+        typeComboBox.isEnabled = false
+        historyButton.isEnabled = false
     }
 
     private fun setupListeners() {
@@ -164,14 +235,14 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             refreshConfigList()
         }
 
-        searchField.document.addDocumentListener(object : DocumentListener {
+        searchField.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent) = filterConfigList()
             override fun removeUpdate(e: DocumentEvent) = filterConfigList()
             override fun changedUpdate(e: DocumentEvent) = filterConfigList()
         })
 
-        configTable.selectionModel.addListSelectionListener { e ->
-            if (!e.valueIsAdjusting) {
+        configList.selectionModel.addListSelectionListener { e ->
+            if (!e.valueIsAdjusting && !updatingList) {
                 onConfigItemSelected()
             }
         }
@@ -183,6 +254,15 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         publishButton.addActionListener {
             publishConfig()
         }
+        historyButton.addActionListener {
+            val item = getSelectedConfigItem()
+            val environment = currentEnv
+            if (!busy && contentLoaded && item != null && environment != null) {
+                NacosHistoryDialog(project, apiClient, environment, item, currentToken, contentArea.text, contentArea.format).show()
+            }
+        }
+        typeComboBox.addActionListener { updateEditorFormat() }
+        contentArea.onTextChanged = { lineCount -> editorInfo.text = "UTF-8 · $lineCount 行 · 2 空格" }
     }
 
     private fun scanConfigFiles() {
@@ -286,7 +366,9 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         currentEnv = null
         currentToken = ""
         allConfigItems = emptyList()
-        updateConfigTable(emptyList())
+        updateConfigList(emptyList())
+        connectionLabel.text = "正在连接…"
+        connectionLabel.icon = null
         setStatus("正在连接 ${env.serverAddr} ...")
         setUIEnabled(false)
 
@@ -300,7 +382,10 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                     currentEnv = env
                     currentToken = loginResp.accessToken
                     allConfigItems = configResp.pageItems
-                    updateConfigTable(allConfigItems)
+                    updateConfigList(allConfigItems)
+                    connectionLabel.text = "${env.profileName} 已连接"
+                    connectionLabel.icon = AllIcons.General.InspectionsOK
+                    connectionLabel.toolTipText = env.serverAddr
                     refreshButton.isEnabled = true
                     setUIEnabled(true)
                     setStatus("已连接 [${env.profileName}] ${env.serverAddr}，共 ${configResp.totalCount} 个配置")
@@ -309,6 +394,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                 LOG.warn("Failed to connect to Nacos: ${env.serverAddr}", e)
                 invokeLaterIfAlive {
                     setUIEnabled(true)
+                    connectionLabel.text = "连接失败"
                     setStatus("连接失败: ${e.message}")
                     Messages.showErrorDialog(project, "连接 Nacos 失败:\n${e.message}", "连接错误")
                 }
@@ -332,11 +418,11 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                     if (connectionId != requestConnectionId) return@invokeLaterIfAlive
                     currentToken = loginResp.accessToken
                     allConfigItems = configResp.pageItems
-                    val selectedItem = getSelectedConfigItem()
-                    updateConfigTable(allConfigItems)
-                    restoreSelection(selectedItem)
+                    val keyword = searchField.text.trim().lowercase()
+                    updateConfigList(allConfigItems.filter { keyword.isEmpty() || it.dataId.lowercase().contains(keyword) || it.group.lowercase().contains(keyword) })
                     setUIEnabled(true)
                     setStatus("已刷新，共 ${configResp.totalCount} 个配置")
+                    if (getSelectedConfigItem() != null) onConfigItemSelected()
                 }
             } catch (e: Exception) {
                 LOG.warn("Failed to refresh config list", e)
@@ -357,35 +443,48 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                 it.dataId.lowercase().contains(keyword) || it.group.lowercase().contains(keyword)
             }
         }
-        updateConfigTable(filtered)
+        updateConfigList(filtered)
     }
 
-    private fun updateConfigTable(items: List<NacosConfigItem>) {
-        displayedConfigItems = items
-        tableModel.setRowCount(0)
-        for (item in items) {
-            tableModel.addRow(arrayOf(item.dataId, item.group, item.type))
+    private fun updateConfigList(items: List<NacosConfigItem>) {
+        val selected = getSelectedConfigItem()
+        updatingList = true
+        try {
+            listModel.clear()
+            items.forEach { listModel.addElement(it) }
+            configList.selectedIndex = items.indexOfFirst { selected != null && it.dataId == selected.dataId && it.group == selected.group }
+        } finally {
+            updatingList = false
         }
+        countLabel.text = items.size.toString()
+        configList.emptyText.text = if (currentEnv == null) "连接 Nacos 后显示配置" else "没有匹配的配置"
+        // 搜索仍包含当前行时保留编辑草稿，不能因列表重建而重新载入正文。
+        if (getSelectedConfigItem() == null) onConfigItemSelected()
     }
 
     private fun onConfigItemSelected() {
         contentRequestId++
         contentLoaded = false
         contentArea.isEditable = false
+        historyButton.isEnabled = false
         val item = getSelectedConfigItem() ?: run {
             contentArea.text = ""
+            configTitle.text = "未选择配置"
+            configMetadata.text = "选择配置后显示 Data ID / Group / Namespace"
+            typeComboBox.isEnabled = false
             publishButton.isEnabled = false
             fetchLatestButton.isEnabled = false
             return
         }
 
+        configTitle.text = item.dataId
+        configTitle.toolTipText = "Data ID: ${item.dataId}"
+        configMetadata.text = "${item.group}  /  namespace: ${currentEnv?.namespace?.ifBlank { "public" } ?: "public"}"
+        configMetadata.toolTipText = configMetadata.text
         contentArea.text = item.content
-        contentArea.caretPosition = 0
-
-        val typeIdx = (0 until typeComboBox.itemCount).firstOrNull {
-            typeComboBox.getItemAt(it) == item.type
-        } ?: -1
-        if (typeIdx >= 0) typeComboBox.selectedIndex = typeIdx
+        typeComboBox.selectedItem = NacosConfigEditor.normalizeFormat(item.type.ifBlank { item.dataId.substringAfterLast('.', "text") })
+        updateEditorFormat()
+        typeComboBox.isEnabled = !busy
 
         publishButton.isEnabled = false
         fetchLatestButton.isEnabled = !busy
@@ -403,6 +502,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         contentArea.isEditable = false
         publishButton.isEnabled = false
         fetchLatestButton.isEnabled = false
+        historyButton.isEnabled = false
 
         setStatus("正在获取 ${item.dataId} 的最新配置...")
 
@@ -412,11 +512,11 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                 invokeLaterIfAlive {
                     if (requestId != contentRequestId || requestConnectionId != connectionId) return@invokeLaterIfAlive
                     contentArea.text = content
-                    contentArea.caretPosition = 0
                     contentLoaded = true
                     contentArea.isEditable = !busy
                     publishButton.isEnabled = !busy
                     fetchLatestButton.isEnabled = !busy
+                    historyButton.isEnabled = !busy
                     setStatus("已获取 ${item.dataId} 的最新配置")
                 }
             } catch (e: Exception) {
@@ -486,18 +586,11 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         }
     }
 
-    private fun getSelectedConfigItem(): NacosConfigItem? {
-        val row = configTable.selectedRow
-        if (row < 0 || row >= displayedConfigItems.size) return null
-        return displayedConfigItems[row]
-    }
+    private fun getSelectedConfigItem(): NacosConfigItem? = configList.selectedValue
 
-    private fun restoreSelection(item: NacosConfigItem?) {
-        if (item == null) return
-        val idx = displayedConfigItems.indexOfFirst { it.dataId == item.dataId && it.group == item.group }
-        if (idx >= 0) {
-            configTable.setRowSelectionInterval(idx, idx)
-        }
+    private fun updateEditorFormat() {
+        contentArea.setFormat(typeComboBox.selectedItem as? String ?: "text")
+        highlightingLabel.text = if (contentArea.highlightingAvailable) "注释、键名和值按 IDEA 配色区分" else "当前格式的语言支持未启用，按纯文本显示"
     }
 
     private fun setStatus(text: String) {
@@ -511,11 +604,13 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         configFileComboBox.isEnabled = enabled
         envComboBox.isEnabled = enabled
         scanButton.isEnabled = enabled && !scanning
-        configTable.isEnabled = enabled
-        searchField.isEnabled = enabled
+        configList.isEnabled = enabled
+        searchField.textEditor.isEnabled = enabled
+        typeComboBox.isEnabled = enabled && getSelectedConfigItem() != null
         contentArea.isEditable = enabled && contentLoaded
         publishButton.isEnabled = enabled && contentLoaded && getSelectedConfigItem() != null
         fetchLatestButton.isEnabled = enabled && getSelectedConfigItem() != null
+        historyButton.isEnabled = enabled && contentLoaded && getSelectedConfigItem() != null
     }
 
     private fun invokeLaterIfAlive(action: () -> Unit) {
@@ -533,5 +628,11 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
     companion object {
         private val LOG = Logger.getInstance(NacosConsolePanel::class.java)
+
+        private fun smallLabel(text: String) = JLabel(text).apply {
+            foreground = UIUtil.getContextHelpForeground()
+            font = UIUtil.getLabelFont(UIUtil.FontSize.SMALL)
+            putClientProperty("html.disable", true)
+        }
     }
 }

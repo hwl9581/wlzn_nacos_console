@@ -6,6 +6,8 @@ import com.google.gson.JsonParser
 import com.intellij.openapi.diagnostic.Logger
 import com.wlzn.nacos.model.ConfigListResponse
 import com.wlzn.nacos.model.LoginResponse
+import com.wlzn.nacos.model.HistoryListResponse
+import com.wlzn.nacos.model.NacosHistoryItem
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -26,11 +28,14 @@ class NacosApiClient {
     // 每个面板只保留最后一次成功探测的路由，不缓存凭据；不同地址的并发请求不会复用彼此的路由。
     @Volatile
     private var configEndpoint: ConfigEndpoint? = null
+    @Volatile
+    private var historyEndpoint: ConfigEndpoint? = null
 
     fun login(serverAddr: String, username: String, password: String): LoginResponse {
         LOG.info("Login request to ${normalizeAddr(serverAddr)}")
         val serverKey = addressUri(serverAddr).toString().trimEnd('/')
         if (configEndpoint?.serverAddr == serverKey) configEndpoint = null
+        if (historyEndpoint?.serverAddr == serverKey) historyEndpoint = null
         val bases = baseUrls(serverAddr)
         val urls = bases.flatMap { listOf("$it/v3/auth/user/login", "$it/v1/auth/login") }
         var response: HttpResponse<String>? = null
@@ -108,6 +113,76 @@ class NacosApiClient {
             )
         )
         return if (isLegacy(response)) response.body().trim() == "true" else responseData(response).asBoolean
+    }
+
+    fun getHistoryList(serverAddr: String, dataId: String, group: String, tenant: String,
+                       accessToken: String, pageNo: Int = 1, pageSize: Int = 50): HistoryListResponse {
+        require(pageNo >= 1 && pageSize in 1..500)
+        val serverKey = addressUri(serverAddr).toString().trimEnd('/')
+        if (configEndpoint?.serverAddr != serverKey) getConfigList(serverAddr, tenant, accessToken, pageSize = 1)
+        val config = checkNotNull(configEndpoint?.takeIf { it.serverAddr == serverKey })
+        val cached = historyEndpoint?.takeIf { it.serverAddr == serverKey && it.baseUrl == config.baseUrl }
+        val candidates = cached?.let { listOf(it) } ?: if (config.apiPath == "/v1") {
+            listOf(config.copy(apiPath = "/v2"), config)
+        } else listOf(config)
+        val parameters = mapOf("dataId" to dataId, "groupName" to group, "namespaceId" to tenant,
+            "accessToken" to accessToken, "pageNo" to pageNo.toString(), "pageSize" to pageSize.toString())
+        var lastResponse: HttpResponse<String>? = null
+        for (endpoint in candidates) {
+            val response = sendHistory(endpoint, true, parameters)
+            lastResponse = response
+            if (cached == null && (response.statusCode() == 404 || response.statusCode() == 410)) continue
+            val data = responseData(checkResponse(response))
+            check(data.isJsonObject && data.asJsonObject.get("pageItems")?.isJsonArray == true) {
+                "获取历史版本失败：服务端未返回有效的分页数据"
+            }
+            val result = gson.fromJson(data, HistoryListResponse::class.java)
+            check(result.pageItems.orEmpty().all { record ->
+                !record.id.isNullOrBlank() && record.dataId == dataId && record.group == group &&
+                    record.namespace.orEmpty().ifBlank { "public" } == tenant.ifBlank { "public" }
+            }) { "历史版本列表与请求的配置或命名空间不一致" }
+            historyEndpoint = endpoint
+            return result
+        }
+        checkResponse(checkNotNull(lastResponse))
+        error("当前 Nacos 服务未提供历史版本查询接口")
+    }
+
+    fun getHistory(serverAddr: String, dataId: String, group: String, tenant: String,
+                   accessToken: String, historyId: String): NacosHistoryItem {
+        require(historyId.isNotBlank())
+        val serverKey = addressUri(serverAddr).toString().trimEnd('/')
+        if (historyEndpoint?.serverAddr != serverKey) getHistoryList(serverAddr, dataId, group, tenant, accessToken, pageSize = 1)
+        val endpoint = checkNotNull(historyEndpoint?.takeIf { it.serverAddr == serverKey })
+        val response = checkResponse(sendHistory(endpoint, false, mapOf(
+            "dataId" to dataId, "groupName" to group, "namespaceId" to tenant,
+            "accessToken" to accessToken, "nid" to historyId
+        )))
+        val data = responseData(response)
+        check(data.isJsonObject) { "此历史版本不存在或已被清理" }
+        val result = gson.fromJson(data, NacosHistoryItem::class.java)
+        check(result.content != null) { "此历史版本没有可读取的配置正文，可能已被清理" }
+        // 旧版本 public 历史可能省略 tenant；仅将缺失值归一为 public，不能匹配其他命名空间。
+        check(result.id == historyId && result.dataId == dataId && result.group == group &&
+            result.namespace.orEmpty().ifBlank { "public" } == tenant.ifBlank { "public" }) {
+            "历史版本响应与请求的配置不一致"
+        }
+        return result
+    }
+
+    private fun sendHistory(endpoint: ConfigEndpoint, list: Boolean, parameters: Map<String, String>): HttpResponse<String> {
+        val legacy = endpoint.apiPath == "/v1"
+        val v2 = endpoint.apiPath == "/v2"
+        val path = if (list && !legacy) "/cs/history/list" else "/cs/history"
+        val actualParameters = parameters.map { (key, value) ->
+            when {
+                (legacy || v2) && key == "groupName" -> "group" to value
+                legacy && key == "namespaceId" -> "tenant" to value
+                !legacy && !v2 && key == "namespaceId" -> key to value.ifBlank { "public" }
+                else -> key to value
+            }
+        }.toMap() + if (legacy && list) mapOf("search" to "accurate") else emptyMap()
+        return send("${endpoint.baseUrl}${endpoint.apiPath}$path", "GET", actualParameters)
     }
 
     private fun requestConfig(
@@ -203,7 +278,8 @@ class NacosApiClient {
         return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString())
     }
 
-    private fun isLegacy(response: HttpResponse<String>): Boolean = response.uri().path.endsWith("/v1/cs/configs")
+    private fun isLegacy(response: HttpResponse<String>): Boolean = response.uri().path.endsWith("/v1/cs/configs") ||
+        response.uri().path.endsWith("/v1/cs/history")
 
     private fun responseData(response: HttpResponse<String>): JsonElement {
         val json = JsonParser.parseString(response.body())

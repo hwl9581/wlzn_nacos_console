@@ -15,6 +15,8 @@
             <li>Browse all configurations under a Nacos namespace</li>
             <li>Refresh and fetch the latest configuration content</li>
             <li>Edit and publish configurations directly from the IDE</li>
+            <li>Native IDE editor with syntax highlighting, line numbers and indentation guides; colors follow your editor scheme</li>
+            <li>Browse paginated configuration history and compare a revision with the current draft or another revision using the read-only IDE diff viewer</li>
             <li>Search / filter configurations by DataId or Group</li>
         </ul>
 
@@ -25,6 +27,8 @@
             <li>一键连接 Nacos，浏览命名空间下所有配置</li>
             <li>实时刷新、获取最新配置内容</li>
             <li>在 IDE 内直接编辑并发布配置</li>
+            <li>原生编辑器语法高亮，区分注释、键名和值，支持行号、缩进线和主题配色</li>
+            <li>分页查看历史版本，与当前编辑内容或其他历史版本进行只读差异对比</li>
         </ul>
     ]]></description>
 

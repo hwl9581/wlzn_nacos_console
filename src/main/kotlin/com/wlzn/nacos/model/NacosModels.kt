@@ -47,3 +47,25 @@ data class ConfigListResponse(
     val pagesAvailable: Int = 0,
     val pageItems: List<NacosConfigItem> = emptyList()
 )
+
+data class NacosHistoryItem(
+    val id: String = "",
+    val dataId: String = "",
+    @SerializedName(value = "groupName", alternate = ["group"])
+    val group: String = "",
+    @SerializedName(value = "namespaceId", alternate = ["tenant"])
+    val namespace: String? = null,
+    val content: String? = null,
+    val srcUser: String? = null,
+    val opType: String? = null,
+    val publishType: String? = null,
+    @SerializedName(value = "modifyTime", alternate = ["lastModifiedTime", "lastModified"])
+    val modifiedTime: String? = null
+)
+
+data class HistoryListResponse(
+    val totalCount: Int = 0,
+    val pageNumber: Int = 1,
+    val pagesAvailable: Int = 0,
+    val pageItems: List<NacosHistoryItem>? = null
+)

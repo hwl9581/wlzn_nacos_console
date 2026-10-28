@@ -46,6 +46,103 @@ class NacosApiClientTest {
     }
 
     @Test
+    fun `console history preserves scope pagination large ids and empty content without writes`() {
+        routes["GET /nacos/v3/console/cs/config/list"] = 200 to emptyList
+        routes["GET /nacos/v3/console/cs/history/list"] = 200 to """{"code":0,"data":{"totalCount":51,"pageNumber":2,"pagesAvailable":2,"pageItems":[{"id":"9007199254740993","dataId":"应用.yml","groupName":"GROUP A","modifyTime":1741682102157,"srcUser":null}]}}"""
+        routes["GET /nacos/v3/console/cs/history"] = 200 to """{"code":0,"data":{"id":"9007199254740993","dataId":"应用.yml","groupName":"GROUP A","content":""}}"""
+        val result = client.getHistoryList(address, "应用.yml", "GROUP A", "", "token", 2)
+        assertEquals(51, result.totalCount)
+        assertEquals("9007199254740993", result.pageItems!!.single().id)
+        assertEquals("1741682102157", result.pageItems.single().modifiedTime)
+        assertEquals("2", requests.last().params["pageNo"])
+        assertEquals("50", requests.last().params["pageSize"])
+        assertEquals("public", requests.last().params["namespaceId"])
+        assertEquals("GROUP A", requests.last().params["groupName"])
+        assertEquals("", client.getHistory(address, "应用.yml", "GROUP A", "", "token", "9007199254740993").content)
+        assertEquals("9007199254740993", requests.last().params["nid"])
+        assertTrue(requests.all { it.method == "GET" })
+    }
+
+    @Test
+    fun `admin history stays on the detected server route`() {
+        routes["GET /nacos/v3/admin/cs/config/list"] = 200 to emptyList
+        routes["GET /nacos/v3/admin/cs/history/list"] = 200 to emptyList
+        client.getHistoryList(address, "a", "g", "demo", "token")
+        assertEquals("/nacos/v3/admin/cs/history/list", requests.last().path)
+        assertEquals("demo", requests.last().params["namespaceId"])
+        assertFalse(requests.any { it.path == "/nacos/v1/cs/history" })
+    }
+
+    @Test
+    fun `legacy configuration routes use v2 history when available`() {
+        routes["GET /nacos/v1/cs/configs"] = 200 to """{"pageItems":[],"totalCount":0}"""
+        routes["GET /nacos/v2/cs/history/list"] = 200 to emptyList
+        client.getHistoryList(address, "a", "g", "", "token")
+        assertEquals("/nacos/v2/cs/history/list", requests.last().path)
+        assertEquals("", requests.last().params["namespaceId"])
+        assertEquals("g", requests.last().params["group"])
+        routes["GET /nacos/v2/cs/history"] = 200 to """{"code":0,"data":{"id":"7","dataId":"a","group":"g","content":"# demo\na=1"}}"""
+        assertEquals("# demo\na=1", client.getHistory(address, "a", "g", "", "token", "7").content)
+        assertFalse(requests.any { it.path == "/nacos/v1/cs/history" })
+    }
+
+    @Test
+    fun `v1 history uses search accurate tenant and raw detail responses`() {
+        routes["GET /nacos/v1/cs/configs"] = 200 to """{"pageItems":[],"totalCount":0}"""
+        routes["GET /nacos/v1/cs/history"] = 200 to """{"totalCount":1,"pageItems":[{"id":7,"dataId":"a","group":"g","tenant":"demo","lastModifiedTime":"2026-01-01T00:00:00Z"}]}"""
+        val result = client.getHistoryList(address, "a", "g", "demo", "token")
+        assertEquals("7", result.pageItems!!.single().id)
+        assertEquals("accurate", requests.last().params["search"])
+        assertEquals("demo", requests.last().params["tenant"])
+        assertFalse(requests.last().params.containsKey("namespaceId"))
+        routes["GET /nacos/v1/cs/history"] = 200 to """{"id":7,"dataId":"a","group":"g","tenant":"demo","content":"a: 1"}"""
+        assertEquals("a: 1", client.getHistory(address, "a", "g", "demo", "token", "7").content)
+        assertFalse(requests.last().params.containsKey("search"))
+        assertTrue(requests.all { it.method == "GET" })
+    }
+
+    @Test
+    fun `history authentication and business errors never downgrade routes`() {
+        routes["GET /nacos/v1/cs/configs"] = 200 to """{"pageItems":[],"totalCount":0}"""
+        client.getConfigList(address, "demo", "token")
+        for (response in listOf(403 to "denied", 500 to "failure", 200 to """{"code":403,"message":"forbidden","data":{}}""")) {
+            requests.clear()
+            routes["GET /nacos/v2/cs/history/list"] = response
+            assertThrows(IllegalStateException::class.java) { client.getHistoryList(address, "a", "g", "demo", "token") }
+            assertEquals(1, requests.size)
+            assertEquals("/nacos/v2/cs/history/list", requests.single().path)
+        }
+    }
+
+    @Test
+    fun `history rejects other namespaces and cleared v1 records`() {
+        routes["GET /nacos/v1/cs/configs"] = 200 to """{"pageItems":[],"totalCount":0}"""
+        routes["GET /nacos/v1/cs/history"] = 200 to """{"totalCount":1,"pageItems":[{"id":"7","dataId":"a","group":"g","tenant":"other"}]}"""
+        assertThrows(IllegalStateException::class.java) { client.getHistoryList(address, "a", "g", "demo", "token") }
+        routes["GET /nacos/v1/cs/history"] = 200 to """{"totalCount":1,"pageItems":[{"id":"7","dataId":"a","group":"g","tenant":"demo"}]}"""
+        client.getHistoryList(address, "a", "g", "demo", "token")
+        for (body in listOf("null", """{"id":"7","dataId":"a","group":"g","tenant":"other","content":"other scope"}""",
+            """{"id":"7","dataId":"a","group":"g","content":"missing namespace"}""")) {
+            routes["GET /nacos/v1/cs/history"] = 200 to body
+            assertThrows(IllegalStateException::class.java) { client.getHistory(address, "a", "g", "demo", "token", "7") }
+        }
+    }
+
+    @Test
+    fun `history details never fall back and reject missing or mismatched records`() {
+        routes["GET /nacos/v3/console/cs/config/list"] = 200 to emptyList
+        routes["GET /nacos/v3/console/cs/history/list"] = 200 to emptyList
+        client.getHistoryList(address, "a", "g", "", "token")
+        for (response in listOf(404 to "Not Found", 200 to """{"code":0,"data":{"id":"7","dataId":"a","groupName":"g","content":null}}""",
+            200 to """{"code":0,"data":{"id":"8","dataId":"other","groupName":"g","content":"unexpected"}}""")) {
+            requests.clear()
+            routes["GET /nacos/v3/console/cs/history"] = response
+            assertThrows(IllegalStateException::class.java) { client.getHistory(address, "a", "g", "", "token", "7") }
+            assertEquals(1, requests.size)
+        }
+    }
+
+    @Test
     fun `nacos 3 login list detail and publish use new contracts`() {
         routes["POST /nacos/v3/auth/user/login"] = 200 to """{"accessToken":"test-token","tokenTtl":18000}"""
         routes["GET /nacos/v3/console/cs/config/list"] = 200 to """
