@@ -69,6 +69,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     private var allConfigItems = listOf<NacosConfigItem>()
     private var contentRequestId = 0
     private var configParseId = 0
+    @Volatile
     private var connectionId = 0
     private var scanning = false
     private var busy = false
@@ -555,16 +556,24 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         if (confirm != Messages.YES) return
 
         val type = typeComboBox.selectedItem as? String ?: "yaml"
-        val token = currentToken
+        val requestConnectionId = connectionId
         setUIEnabled(false)
-        setStatus("正在发布 ${item.dataId} ...")
+        setStatus("正在重新认证并发布 ${item.dataId} ...")
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                // 发布前获取新 Token，避免长时间打开工具窗口后复用过期登录态。
+                // 登录或只读路由探测失败就停止，配置正文仍只 POST 一次，不重试失败的写入。
+                val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
+                if (disposed || project.isDisposed || requestConnectionId != connectionId) return@executeOnPooledThread
+                invokeLaterIfAlive {
+                    if (requestConnectionId == connectionId) currentToken = loginResp.accessToken
+                }
                 val success = apiClient.publishConfig(
-                    env.serverAddr, item.dataId, item.group, env.namespace, content, type, token
+                    env.serverAddr, item.dataId, item.group, env.namespace, content, type, loginResp.accessToken
                 )
                 invokeLaterIfAlive {
+                    if (requestConnectionId != connectionId) return@invokeLaterIfAlive
                     setUIEnabled(true)
                     if (success) {
                         setStatus("发布成功: ${item.dataId}")
@@ -578,6 +587,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             } catch (e: Exception) {
                 LOG.warn("Failed to publish config: ${item.dataId}", e)
                 invokeLaterIfAlive {
+                    if (requestConnectionId != connectionId) return@invokeLaterIfAlive
                     setUIEnabled(true)
                     setStatus("发布异常: ${e.message}")
                     notify("发布异常: ${e.message}", NotificationType.ERROR)
