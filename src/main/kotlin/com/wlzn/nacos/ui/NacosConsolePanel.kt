@@ -26,6 +26,10 @@ import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.wlzn.nacos.model.NacosConfigItem
+import com.wlzn.nacos.config.ManualNacosConnection
+import com.wlzn.nacos.config.NacosConnectionAccess
+import com.wlzn.nacos.config.NacosConnectionSettings
+import com.wlzn.nacos.config.NacosConnectionsListener
 import com.wlzn.nacos.model.NacosEnvironment
 import com.wlzn.nacos.service.NacosApiClient
 import com.wlzn.nacos.service.NacosConfigFileParser
@@ -34,13 +38,28 @@ import javax.swing.*
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
-class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
+class NacosConsolePanel internal constructor(
+    private val project: Project,
+    private val manualSettings: NacosConnectionSettings = NacosConnectionSettings.getInstance(),
+    private val manualAccess: NacosConnectionAccess = NacosConnectionAccess(manualSettings)
+) : JPanel(BorderLayout()), Disposable {
 
     private val apiClient = NacosApiClient()
     private val configParser = NacosConfigFileParser()
 
     private val configFileComboBox = JComboBox<String>()
     private val envComboBox = JComboBox<NacosEnvironment>()
+    private val projectModeButton = JToggleButton("项目配置")
+    private val manualModeButton = JToggleButton("手动连接")
+    private val manualComboBox = JComboBox<ManualNacosConnection>()
+    private val manageConnectionsButton = JButton("管理连接", AllIcons.General.Settings)
+    private val sourceCards = JPanel(CardLayout())
+    private val locationLabel = smallLabel("请选择连接")
+    private var manualMode = manualSettings.state.manualMode
+    private var selectedManualId = manualSettings.state.selectedConnectionId
+    private var updatingConnections = false
+    @Volatile private var currentManualConnection: ManualNacosConnection? = null
+    private var loadedText: String? = null
     private val connectButton = JButton("连接")
     private val refreshButton = JButton("刷新列表")
     private val scanButton = JButton("扫描配置文件")
@@ -86,7 +105,19 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         Disposer.register(this, contentArea)
         setupUI()
         setupListeners()
-        ApplicationManager.getApplication().invokeLater({ scanConfigFiles() }, ModalityState.nonModal())
+        reloadManualConnections()
+        updateSourceUI()
+        ApplicationManager.getApplication().messageBus.connect(this).subscribe(NacosConnectionsListener.TOPIC, NacosConnectionsListener {
+            invokeLaterIfAlive {
+                val changed = currentManualConnection?.let { manualSettings.find(it.id) != it } == true
+                reloadManualConnections()
+                if (changed) {
+                    invalidateConnection(true)
+                    setStatus("连接配置已修改或移除，请重新连接；未发布内容已保留")
+                }
+            }
+        })
+        ApplicationManager.getApplication().invokeLater({ if (!manualMode) scanConfigFiles() }, ModalityState.nonModal())
     }
 
     override fun dispose() {
@@ -94,13 +125,14 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun setupUI() {
-        val topPanel = JPanel(GridBagLayout()).apply {
+        val controlsPanel = JPanel(GridBagLayout())
+        val topPanel = JPanel(BorderLayout(0, JBUI.scale(5))).apply {
             border = BorderFactory.createCompoundBorder(JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0), JBUI.Borders.empty(8, 12))
         }
-        configFileComboBox.preferredSize = JBUI.size(300, 30)
+        configFileComboBox.preferredSize = JBUI.size(220, 30)
         configFileComboBox.minimumSize = JBUI.size(100, 30)
         configFileComboBox.toolTipText = "用于解析 Nacos 环境的 Spring Boot 配置文件"
-        envComboBox.preferredSize = JBUI.size(175, 30)
+        envComboBox.preferredSize = JBUI.size(105, 30)
         envComboBox.minimumSize = JBUI.size(110, 30)
         envComboBox.renderer = object : DefaultListCellRenderer() {
             override fun getListCellRendererComponent(list: JList<*>?, value: Any?, index: Int, selected: Boolean, focus: Boolean): Component {
@@ -124,9 +156,27 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         fetchLatestButton.icon = AllIcons.Actions.Refresh
         historyButton.icon = AllIcons.Vcs.History
         publishButton.icon = AllIcons.Actions.Upload
-        val controls = listOf(smallLabel("配置源"), configFileComboBox, scanButton, smallLabel("环境"), envComboBox, connectButton, connectionLabel)
+        ButtonGroup().apply { add(projectModeButton); add(manualModeButton) }
+        val modePanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { add(projectModeButton); add(manualModeButton) }
+        val projectSource = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(5), 0)).apply {
+            add(configFileComboBox); add(scanButton); add(smallLabel("环境")); add(envComboBox)
+        }
+        manualComboBox.preferredSize = JBUI.size(185, 30)
+        manualComboBox.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(list: JList<*>?, value: Any?, index: Int, selected: Boolean, focus: Boolean): Component {
+                super.getListCellRendererComponent(list, value, index, selected, focus)
+                putClientProperty("html.disable", true)
+                text = (value as? ManualNacosConnection)?.name ?: "添加手动连接"
+                toolTipText = (value as? ManualNacosConnection)?.serverAddr
+                return this
+            }
+        }
+        val manualSource = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(5), 0)).apply { add(manualComboBox); add(manageConnectionsButton) }
+        sourceCards.add(projectSource, "project")
+        sourceCards.add(manualSource, "manual")
+        val controls = listOf(modePanel, sourceCards, connectButton, connectionLabel)
         controls.forEachIndexed { index, component ->
-            topPanel.add(component, GridBagConstraints().apply {
+            controlsPanel.add(component, GridBagConstraints().apply {
                 gridx = index; gridy = 0
                 weightx = if (component === connectionLabel) 1.0 else 0.0
                 fill = GridBagConstraints.NONE
@@ -134,6 +184,27 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                 insets = JBUI.insets(0, if (index == 0) 0 else 8, 0, 0)
             })
         }
+        var compact: Boolean? = null
+        fun layoutControls() {
+            val narrow = controlsPanel.width in 1 until JBUI.scale(900)
+            if (compact == narrow) return
+            compact = narrow
+            val layout = controlsPanel.layout as GridBagLayout
+            controls.forEachIndexed { index, component ->
+                val constraints = layout.getConstraints(component)
+                constraints.gridx = if (narrow) { if (index <= 1) 0 else 1 } else index
+                constraints.gridy = if (narrow && index in 1..2) 1 else 0
+                constraints.insets = JBUI.insets(if (narrow && index in 1..2) 6 else 0, if (index == 0 || (narrow && index == 1)) 0 else 8, 0, 0)
+                layout.setConstraints(component, constraints)
+            }
+            controlsPanel.revalidate()
+        }
+        controlsPanel.addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(event: java.awt.event.ComponentEvent) { layoutControls() }
+        })
+        layoutControls()
+        topPanel.add(controlsPanel, BorderLayout.NORTH)
+        topPanel.add(locationLabel, BorderLayout.SOUTH)
 
         configList.selectionMode = ListSelectionModel.SINGLE_SELECTION
         configList.emptyText.text = "连接 Nacos 后显示配置"
@@ -220,9 +291,39 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun setupListeners() {
+        projectModeButton.addActionListener { changeSource(false) }
+        manualModeButton.addActionListener { changeSource(true) }
+        manualComboBox.addActionListener {
+            if (!updatingConnections) {
+                val id = (manualComboBox.selectedItem as? ManualNacosConnection)?.id.orEmpty()
+                if (id != selectedManualId) {
+                    if (confirmDiscardDraft()) {
+                        selectedManualId = id
+                        manualSettings.rememberSelection(manualMode, id)
+                        invalidateConnection(false)
+                        updateLocation()
+                    } else reloadManualConnections()
+                }
+            }
+        }
+        manageConnectionsButton.addActionListener {
+            val dialog = NacosConnectionsDialog(project, selectedManualId, manualSettings, manualAccess)
+            if (dialog.showAndGet()) {
+                dialog.savedConnection?.let {
+                    if (!confirmDiscardDraft()) { reloadManualConnections(); return@let }
+                    manualMode = true
+                    selectedManualId = it.id
+                    manualSettings.rememberSelection(true, it.id)
+                    reloadManualConnections()
+                    updateSourceUI()
+                    connectToNacos(true)
+                }
+            }
+        }
         configFileComboBox.addActionListener {
             onConfigFileSelected()
         }
+        envComboBox.addActionListener { if (!manualMode) updateLocation() }
 
         scanButton.addActionListener {
             scanConfigFiles()
@@ -267,7 +368,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun scanConfigFiles() {
-        if (disposed || project.isDisposed || scanning) return
+        if (disposed || project.isDisposed || scanning || manualMode) return
         val basePath = project.basePath ?: return
         scanning = true
         scanButton.isEnabled = false
@@ -284,8 +385,8 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             if (baseDir == null) {
                 invokeLaterIfAlive {
                     scanning = false
-                    scanButton.isEnabled = !busy
-                    setStatus("项目目录不存在")
+                    scanButton.isEnabled = !busy && !manualMode
+                    if (!manualMode) setStatus("项目目录不存在")
                 }
                 return@executeOnPooledThread
             }
@@ -312,7 +413,8 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                         configFileMap.putAll(files)
                         configFileComboBox.model = DefaultComboBoxModel(files.keys.toTypedArray())
                         scanning = false
-                        scanButton.isEnabled = !busy
+                        scanButton.isEnabled = !busy && !manualMode
+                        if (manualMode) return@finishOnUiThread
                         if (files.isNotEmpty()) {
                             configFileComboBox.selectedItem = previousSelection?.takeIf { it in files } ?: files.keys.first()
                             onConfigFileSelected()
@@ -326,6 +428,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     }
 
     private fun onConfigFileSelected() {
+        if (manualMode) return
         val selectedPath = configFileComboBox.selectedItem as? String ?: return
         val vFile = configFileMap[selectedPath] ?: return
         val parseId = ++configParseId
@@ -343,11 +446,12 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             }
         }.expireWith(this)
             .finishOnUiThread(ModalityState.nonModal()) { result ->
-                if (disposed || project.isDisposed || parseId != configParseId || configFileComboBox.selectedItem != selectedPath) return@finishOnUiThread
+                if (disposed || project.isDisposed || manualMode || parseId != configParseId || configFileComboBox.selectedItem != selectedPath) return@finishOnUiThread
                 envComboBox.removeAllItems()
                 result.fold(onSuccess = { environments ->
                     environments.forEach { envComboBox.addItem(it) }
                     connectButton.isEnabled = !busy && environments.isNotEmpty()
+                    updateLocation()
                     setStatus(if (environments.isNotEmpty()) "已解析 ${environments.size} 个环境配置" else "配置文件中未找到 Nacos 配置")
                 }, onFailure = { e ->
                     LOG.warn("Failed to parse config file: $selectedPath", e)
@@ -356,31 +460,39 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             }.submit(AppExecutorUtil.getAppExecutorService())
     }
 
-    private fun connectToNacos() {
-        val env = envComboBox.selectedItem as? NacosEnvironment ?: run {
-            setStatus("请先选择环境")
+    private fun connectToNacos(discardConfirmed: Boolean = false) {
+        if (busy || (!discardConfirmed && !confirmDiscardDraft())) return
+        val manual = if (manualMode) (manualComboBox.selectedItem as? ManualNacosConnection)?.copy() else null
+        val projectEnvironment = if (!manualMode) envComboBox.selectedItem as? NacosEnvironment else null
+        if (manual == null && projectEnvironment == null) {
+            setStatus(if (manualMode) "请先添加手动连接" else "请先选择环境")
             return
         }
 
         connectionId++
         val requestConnectionId = connectionId
         currentEnv = null
+        currentManualConnection = null
         currentToken = ""
+        loadedText = null
         allConfigItems = emptyList()
         updateConfigList(emptyList())
         connectionLabel.text = "正在连接…"
         connectionLabel.icon = null
-        setStatus("正在连接 ${env.serverAddr} ...")
+        setStatus("正在连接 ${manual?.serverAddr ?: projectEnvironment!!.serverAddr} ...")
         setUIEnabled(false)
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                val env = if (manual != null) manualAccess.environment(manual) else checkNotNull(projectEnvironment)
                 val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
                 val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, loginResp.accessToken)
+                ensureManualConnectionCurrent(manual)
 
                 invokeLaterIfAlive {
-                    if (connectionId != requestConnectionId) return@invokeLaterIfAlive
+                    if (!connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     currentEnv = env
+                    currentManualConnection = manual
                     currentToken = loginResp.accessToken
                     allConfigItems = configResp.pageItems
                     updateConfigList(allConfigItems)
@@ -392,8 +504,9 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
                     setStatus("已连接 [${env.profileName}] ${env.serverAddr}，共 ${configResp.totalCount} 个配置")
                 }
             } catch (e: Exception) {
-                LOG.warn("Failed to connect to Nacos: ${env.serverAddr}", e)
+                LOG.warn("Failed to connect to Nacos", e)
                 invokeLaterIfAlive {
+                    if (!connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     setUIEnabled(true)
                     connectionLabel.text = "连接失败"
                     setStatus("连接失败: ${e.message}")
@@ -405,6 +518,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
     private fun refreshConfigList() {
         val env = currentEnv ?: return
+        val manual = currentManualConnection
         val requestConnectionId = connectionId
 
         setStatus("正在刷新配置列表...")
@@ -412,11 +526,13 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                ensureManualConnectionCurrent(manual)
                 val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
                 val configResp = apiClient.getConfigList(env.serverAddr, env.namespace, loginResp.accessToken)
+                ensureManualConnectionCurrent(manual)
 
                 invokeLaterIfAlive {
-                    if (connectionId != requestConnectionId) return@invokeLaterIfAlive
+                    if (!connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     currentToken = loginResp.accessToken
                     allConfigItems = configResp.pageItems
                     val keyword = searchField.text.trim().lowercase()
@@ -428,6 +544,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             } catch (e: Exception) {
                 LOG.warn("Failed to refresh config list", e)
                 invokeLaterIfAlive {
+                    if (!connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     setUIEnabled(true)
                     setStatus("刷新失败: ${e.message}")
                 }
@@ -466,6 +583,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     private fun onConfigItemSelected() {
         contentRequestId++
         contentLoaded = false
+        loadedText = null
         contentArea.isEditable = false
         historyButton.isEnabled = false
         val item = getSelectedConfigItem() ?: run {
@@ -488,7 +606,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         typeComboBox.isEnabled = !busy
 
         publishButton.isEnabled = false
-        fetchLatestButton.isEnabled = !busy
+        fetchLatestButton.isEnabled = !busy && currentEnv != null
         setStatus("已选中: ${item.dataId} [${item.group}]")
         fetchLatestConfig()
     }
@@ -496,6 +614,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
     private fun fetchLatestConfig() {
         val item = getSelectedConfigItem() ?: return
         val env = currentEnv ?: return
+        val manual = currentManualConnection
         val requestId = ++contentRequestId
         val requestConnectionId = connectionId
         val token = currentToken
@@ -509,10 +628,12 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                ensureManualConnectionCurrent(manual)
                 val content = apiClient.getConfig(env.serverAddr, item.dataId, item.group, env.namespace, token)
                 invokeLaterIfAlive {
-                    if (requestId != contentRequestId || requestConnectionId != connectionId) return@invokeLaterIfAlive
+                    if (requestId != contentRequestId || !connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     contentArea.text = content
+                    loadedText = contentArea.text
                     contentLoaded = true
                     contentArea.isEditable = !busy
                     publishButton.isEnabled = !busy
@@ -523,7 +644,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             } catch (e: Exception) {
                 LOG.warn("Failed to fetch config: ${item.dataId}", e)
                 invokeLaterIfAlive {
-                    if (requestId != contentRequestId || requestConnectionId != connectionId) return@invokeLaterIfAlive
+                    if (requestId != contentRequestId || !connectionUnchanged(requestConnectionId, manual)) return@invokeLaterIfAlive
                     fetchLatestButton.isEnabled = !busy
                     setStatus("获取失败: ${e.message}")
                 }
@@ -535,6 +656,7 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         if (busy || !contentLoaded) return
         val item = getSelectedConfigItem() ?: return
         val env = currentEnv ?: return
+        val manual = currentManualConnection
         val content = contentArea.text
 
         if (content.isBlank()) {
@@ -561,19 +683,26 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
         setStatus("正在重新认证并发布 ${item.dataId} ...")
 
         ApplicationManager.getApplication().executeOnPooledThread {
+            var writeAttempted = false
             try {
                 // 发布前获取新 Token，避免长时间打开工具窗口后复用过期登录态。
                 // 登录或只读路由探测失败就停止，配置正文仍只 POST 一次，不重试失败的写入。
+                ensureManualConnectionCurrent(manual)
                 val loginResp = apiClient.login(env.serverAddr, env.username, env.password)
+                ensureManualConnectionCurrent(manual)
                 if (disposed || project.isDisposed || requestConnectionId != connectionId) return@executeOnPooledThread
                 invokeLaterIfAlive {
                     if (requestConnectionId == connectionId) currentToken = loginResp.accessToken
                 }
+                writeAttempted = true
                 val success = apiClient.publishConfig(
                     env.serverAddr, item.dataId, item.group, env.namespace, content, type, loginResp.accessToken
                 )
                 invokeLaterIfAlive {
-                    if (requestConnectionId != connectionId) return@invokeLaterIfAlive
+                    if (!connectionUnchanged(requestConnectionId, manual)) {
+                        notify("配置 ${item.dataId} 在 ${env.profileName} 的发布${if (success) "成功" else "失败"}；连接配置已变化，请重新连接核对", if (success) NotificationType.INFORMATION else NotificationType.ERROR)
+                        return@invokeLaterIfAlive
+                    }
                     setUIEnabled(true)
                     if (success) {
                         setStatus("发布成功: ${item.dataId}")
@@ -587,7 +716,10 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
             } catch (e: Exception) {
                 LOG.warn("Failed to publish config: ${item.dataId}", e)
                 invokeLaterIfAlive {
-                    if (requestConnectionId != connectionId) return@invokeLaterIfAlive
+                    if (!connectionUnchanged(requestConnectionId, manual)) {
+                        if (writeAttempted) notify("配置 ${item.dataId} 在 ${env.profileName} 的发布结果未确认，请重新连接核对", NotificationType.WARNING)
+                        return@invokeLaterIfAlive
+                    }
                     setUIEnabled(true)
                     setStatus("发布异常: ${e.message}")
                     notify("发布异常: ${e.message}", NotificationType.ERROR)
@@ -609,18 +741,102 @@ class NacosConsolePanel(private val project: Project) : JPanel(BorderLayout()), 
 
     private fun setUIEnabled(enabled: Boolean) {
         busy = !enabled
-        connectButton.isEnabled = enabled && envComboBox.itemCount > 0
+        connectButton.isEnabled = enabled && if (manualMode) manualComboBox.itemCount > 0 else envComboBox.itemCount > 0
         refreshButton.isEnabled = enabled && currentEnv != null
-        configFileComboBox.isEnabled = enabled
-        envComboBox.isEnabled = enabled
-        scanButton.isEnabled = enabled && !scanning
-        configList.isEnabled = enabled
-        searchField.textEditor.isEnabled = enabled
+        projectModeButton.isEnabled = enabled
+        manualModeButton.isEnabled = enabled
+        manualComboBox.isEnabled = enabled
+        manageConnectionsButton.isEnabled = enabled
+        configFileComboBox.isEnabled = enabled && !manualMode
+        envComboBox.isEnabled = enabled && !manualMode
+        scanButton.isEnabled = enabled && !scanning && !manualMode
+        configList.isEnabled = enabled && currentEnv != null
+        searchField.textEditor.isEnabled = enabled && currentEnv != null
         typeComboBox.isEnabled = enabled && getSelectedConfigItem() != null
         contentArea.isEditable = enabled && contentLoaded
         publishButton.isEnabled = enabled && contentLoaded && getSelectedConfigItem() != null
-        fetchLatestButton.isEnabled = enabled && getSelectedConfigItem() != null
+        fetchLatestButton.isEnabled = enabled && currentEnv != null && getSelectedConfigItem() != null
         historyButton.isEnabled = enabled && contentLoaded && getSelectedConfigItem() != null
+    }
+
+    private fun ensureManualConnectionCurrent(connection: ManualNacosConnection?) {
+        check(connection == null || manualSettings.find(connection.id) == connection) { "连接配置已变化，请重新连接" }
+    }
+
+    private fun connectionUnchanged(requestId: Int, connection: ManualNacosConnection?): Boolean {
+        if (requestId != connectionId) return false
+        if (connection != null && manualSettings.find(connection.id) != connection) {
+            invalidateConnection(true)
+            setStatus("连接配置已变化，请重新连接；未发布内容已保留")
+            return false
+        }
+        return true
+    }
+
+    private fun confirmDiscardDraft(): Boolean = loadedText == null || loadedText == contentArea.text ||
+        Messages.showYesNoDialog(project, "当前配置有尚未发布的修改，是否丢弃这些修改并切换连接？", "未发布的配置", Messages.getWarningIcon()) == Messages.YES
+
+    private fun invalidateConnection(preserveDraft: Boolean) {
+        connectionId++
+        contentRequestId++
+        currentEnv = null
+        currentManualConnection = null
+        currentToken = ""
+        contentLoaded = false
+        connectionLabel.text = "未连接"
+        connectionLabel.icon = null
+        connectionLabel.toolTipText = null
+        if (!preserveDraft) {
+            loadedText = null
+            allConfigItems = emptyList()
+            updateConfigList(emptyList())
+        }
+        setUIEnabled(true)
+    }
+
+    private fun reloadManualConnections() {
+        updatingConnections = true
+        val connections = manualSettings.connections()
+        manualComboBox.model = DefaultComboBoxModel(connections.toTypedArray())
+        val selected = connections.find { it.id == selectedManualId } ?: connections.firstOrNull()
+        manualComboBox.selectedItem = selected
+        selectedManualId = selected?.id.orEmpty()
+        updatingConnections = false
+        setUIEnabled(!busy)
+        updateLocation()
+    }
+
+    private fun changeSource(manual: Boolean) {
+        if (manual == manualMode) return
+        if (busy || !confirmDiscardDraft()) { updateSourceUI(); return }
+        manualMode = manual
+        configParseId++
+        invalidateConnection(false)
+        manualSettings.rememberSelection(manualMode, selectedManualId)
+        updateSourceUI()
+        if (!manualMode) {
+            if (configFileMap.isEmpty()) scanConfigFiles() else onConfigFileSelected()
+        }
+        setStatus(if (manualMode) "请选择手动连接，或点击管理连接添加" else "请选择项目环境")
+    }
+
+    private fun updateSourceUI() {
+        projectModeButton.isSelected = !manualMode
+        manualModeButton.isSelected = manualMode
+        (sourceCards.layout as CardLayout).show(sourceCards, if (manualMode) "manual" else "project")
+        sourceCards.preferredSize = sourceCards.components.firstOrNull { it.isVisible }?.preferredSize
+        setUIEnabled(!busy)
+        updateLocation()
+        revalidate()
+    }
+
+    private fun updateLocation() {
+        val manual = manualComboBox.selectedItem as? ManualNacosConnection
+        val environment = envComboBox.selectedItem as? NacosEnvironment
+        val address = if (manualMode) manual?.serverAddr else environment?.serverAddr
+        val namespace = if (manualMode) manual?.namespace else environment?.namespace
+        locationLabel.text = if (address == null) "请选择连接" else "$address  ·  Namespace ${namespace?.ifBlank { "public" } ?: "public"}"
+        locationLabel.toolTipText = locationLabel.text
     }
 
     private fun invokeLaterIfAlive(action: () -> Unit) {

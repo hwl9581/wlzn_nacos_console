@@ -46,6 +46,47 @@ class NacosApiClientTest {
     }
 
     @Test
+    fun `missing and hostless addresses fail clearly before sending requests`() {
+        for (value in listOf("", "   ", "http://", "https:///nacos")) {
+            val failure = assertThrows(IllegalArgumentException::class.java) { client.login(value, "demo", "demo") }
+            assertTrue(failure.message.orEmpty().contains("Nacos 服务地址"))
+        }
+        assertTrue(requests.isEmpty())
+    }
+
+    @Test
+    fun `both yaml address spellings can connect through login and configuration list`() {
+        routes["POST /nacos/v3/auth/user/login"] = 200 to """{"accessToken":"demo-token"}"""
+        routes["GET /nacos/v3/console/cs/config/list"] = 200 to emptyList
+        for (key in listOf("serverAddr", "server-addr")) {
+            val environment = NacosConfigFileParser().parse("""
+                nacos:
+                  $key: $address
+                  namespace: demo-space
+                  username: demo-user
+                  password: demo-password
+            """.trimIndent()).single()
+            val token = client.login(environment.serverAddr, environment.username, environment.password).accessToken
+            val configs = client.getConfigList(environment.serverAddr, environment.namespace, token)
+            assertEquals(0, configs.totalCount)
+            assertEquals("demo-space", requests.last().params["namespaceId"])
+            assertEquals("demo-token", requests.last().params["accessToken"])
+        }
+        assertEquals(listOf("POST", "GET", "POST", "GET"), requests.map { it.method })
+    }
+
+    @Test
+    fun `uppercase HTTP and bare addresses can connect through the same endpoints`() {
+        routes["POST /nacos/v3/auth/user/login"] = 200 to """{"accessToken":"demo-token"}"""
+        routes["GET /nacos/v3/console/cs/config/list"] = 200 to emptyList
+        for (value in listOf(address.replace("http://", "HTTP://"), address.removePrefix("http://"))) {
+            val login = client.login(value, "demo", "demo")
+            assertEquals(0, client.getConfigList(value, "", login.accessToken).totalCount)
+        }
+        assertTrue(requests.all { it.path.startsWith("/nacos/") })
+    }
+
+    @Test
     fun `console history preserves scope pagination large ids and empty content without writes`() {
         routes["GET /nacos/v3/console/cs/config/list"] = 200 to emptyList
         routes["GET /nacos/v3/console/cs/history/list"] = 200 to """{"code":0,"data":{"totalCount":51,"pageNumber":2,"pagesAvailable":2,"pageItems":[{"id":"9007199254740993","dataId":"应用.yml","groupName":"GROUP A","modifyTime":1741682102157,"srcUser":null}]}}"""

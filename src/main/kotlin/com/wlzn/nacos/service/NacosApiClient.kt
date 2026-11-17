@@ -307,14 +307,23 @@ class NacosApiClient {
         } else listOf(normalizeAddr(serverAddr))
     }
 
-    private fun addressUri(serverAddr: String): URI {
-        val address = serverAddr.trim()
-        return URI.create(if (address.startsWith("http://") || address.startsWith("https://")) address else "http://$address")
-    }
-
     private fun encode(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8)
 
     companion object {
         private val LOG = Logger.getInstance(NacosApiClient::class.java)
+
+        internal fun addressUri(serverAddr: String): URI {
+            val address = serverAddr.trim()
+            require(address.isNotEmpty()) { "未读取到 Nacos 服务地址，请检查 nacos.server-addr 或 nacos.serverAddr 配置" }
+            val uri = try {
+                URI.create(if (address.contains("://")) address else "http://$address")
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException("Nacos 服务地址格式无效，请填写主机和端口，例如 localhost:8848")
+            }
+            require(uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.port in -1..65535) {
+                "Nacos 服务地址缺少有效主机或端口，请检查 nacos.server-addr 或 nacos.serverAddr 配置"
+            }
+            return uri
+        }
     }
 }

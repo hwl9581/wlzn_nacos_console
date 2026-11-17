@@ -12,7 +12,7 @@ class NacosConfigFileParser {
 
         val baseDoc = asMap(documents[0]) ?: return emptyList()
 
-        val baseServerAddr = getNestedString(baseDoc, "nacos", "server-addr") ?: ""
+        val baseServerAddr = getServerAddr(baseDoc) ?: ""
         val baseNamespace = getNestedString(baseDoc, "nacos", "namespace") ?: ""
         val baseUsername = getNestedString(baseDoc, "nacos", "username") ?: "nacos"
         val basePassword = getNestedString(baseDoc, "nacos", "password") ?: ""
@@ -34,7 +34,7 @@ class NacosConfigFileParser {
             val doc = asMap(documents[i]) ?: continue
             val profileName = getNestedString(doc, "spring", "config", "activate", "on-profile") ?: continue
 
-            val serverAddr = getNestedString(doc, "nacos", "server-addr") ?: baseServerAddr
+            val serverAddr = getServerAddr(doc) ?: baseServerAddr
             val namespace = getNestedString(doc, "nacos", "namespace") ?: baseNamespace
             val username = getNestedString(doc, "nacos", "username") ?: baseUsername
             val password = getNestedString(doc, "nacos", "password") ?: basePassword
@@ -65,6 +65,10 @@ class NacosConfigFileParser {
 
     @Suppress("UNCHECKED_CAST")
     private fun asMap(obj: Any?): Map<String, Any>? = obj as? Map<String, Any>
+
+    // 项目中同时存在连字符与驼峰写法。按文档先解析别名，再继承基础配置。
+    private fun getServerAddr(map: Map<String, Any>): String? =
+        getNestedString(map, "nacos", "server-addr") ?: getNestedString(map, "nacos", "serverAddr")
 
     @Suppress("UNCHECKED_CAST")
     private fun getNestedString(map: Map<String, Any>, vararg keys: String): String? {

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.wlzn"
-version = "1.0.4"
+version = "1.0.6"
 
 // Set the JVM language level used to build the project.
 kotlin {
@@ -44,6 +44,8 @@ intellijPlatform {
 
         changeNotes = """
             <ul>
+                <li><b>1.0.6</b> — Add globally available manual Nacos connections, secure password storage, connection testing and project/manual source switching.</li>
+                <li><b>1.0.5</b> — Accept both nacos.server-addr and nacos.serverAddr in each YAML profile, and report missing or invalid server addresses before connecting.</li>
                 <li><b>1.0.4</b> — Re-authenticate before publishing to prevent expired-token failures after long IDE sessions; stop on login failure and never automatically retry configuration writes.</li>
                 <li><b>1.0.3</b> — Redesign the native configuration workspace; highlight comments, keys and values in the IDE editor, and compare read-only configuration history with the current draft or another revision.</li>
                 <li><b>1.0.2</b> — Fix Nacos 3 server-port connections using Admin APIs, support root-context consoles, and discover routes with read-only requests before publishing.</li>

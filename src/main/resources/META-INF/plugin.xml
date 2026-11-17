@@ -11,6 +11,7 @@
         <h3>Features</h3>
         <ul>
             <li>Auto-detect Spring Boot config files (application.yml / bootstrap.yml)</li>
+            <li>Manage multiple manual connections globally across projects, test connectivity and store passwords securely in the IDE credential store</li>
             <li>Parse multi-document YAML with profile-based environment isolation</li>
             <li>Browse all configurations under a Nacos namespace</li>
             <li>Refresh and fetch the latest configuration content</li>
@@ -23,6 +24,7 @@
         <h3>功能</h3>
         <ul>
             <li>自动扫描项目中的 Spring Boot 配置文件</li>
+            <li>支持手动添加多个 Nacos 连接，所有项目共享，密码安全保存在 IDEA 凭据库</li>
             <li>解析多文档 YAML，按 profile 隔离多环境配置</li>
             <li>一键连接 Nacos，浏览命名空间下所有配置</li>
             <li>实时刷新、获取最新配置内容</li>
