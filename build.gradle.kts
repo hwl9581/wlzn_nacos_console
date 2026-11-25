@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.wlzn"
-version = "1.0.6"
+version = "1.0.7"
 
 // Set the JVM language level used to build the project.
 kotlin {
@@ -44,6 +44,7 @@ intellijPlatform {
 
         changeNotes = """
             <ul>
+                <li><b>1.0.7</b> — Support IntelliJ IDEA 2026.3, including 2026.3.0.1.</li>
                 <li><b>1.0.6</b> — Add globally available manual Nacos connections, secure password storage, connection testing and project/manual source switching.</li>
                 <li><b>1.0.5</b> — Accept both nacos.server-addr and nacos.serverAddr in each YAML profile, and report missing or invalid server addresses before connecting.</li>
                 <li><b>1.0.4</b> — Re-authenticate before publishing to prevent expired-token failures after long IDE sessions; stop on login failure and never automatically retry configuration writes.</li>
@@ -60,7 +61,8 @@ intellijPlatform {
     pluginVerification {
         ides {
             val localPath = providers.gradleProperty("platformLocalPath").orNull
-            if (localPath != null) local(file(localPath)) else recommended()
+            if (localPath != null) local(file(localPath))
+            create(org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.IntellijIdea, "2026.3.0.1")
         }
     }
 }
